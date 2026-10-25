@@ -5,7 +5,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v1 — review before any code |
+| **Status** | Draft v1.1 — infrastructure spine decided (migrations · DB access · HTTP: §13 D11–D15); rest of the design remains Draft v1 |
 | **Date** | 2026-10-25 |
 | **Scope** | Phase 1 only. Phases 2–3: [03-roadmap-phase-2-3.md](03-roadmap-phase-2-3.md) |
 | **Prerequisite** | [01-domain-knowledge.md](01-domain-knowledge.md) — read first |
@@ -115,10 +115,11 @@ tandav/
 │   ├── history/                   # append events, replay driver, command validator
 │   ├── matching/                  # task queues, leasing, redelivery
 │   ├── timers/                    # durable timer store + scanner (the damaru 🥁)
-│   ├── store/                     # Store interface + postgres/ implementation
+│   ├── store/                     # Store interface · migrate.go (goose boot runner)
+│   │   └── postgres/              # impl: sqlc.yaml · queries/*.sql · db/ (generated, committed)
 │   ├── httpapi/                   # router, handlers, middleware, error envelope
 │   └── logx/                      # slog setup, request/execution-scoped loggers
-├── migrations/                    # numbered .sql (up)
+├── migrations/                    # goose: numbered, up-only, DDL-only (also the sqlc schema source)
 ├── web/                           # existing React dashboard (Vite + Tailwind)
 ├── examples/
 │   └── ordersaga/                 # the showcase: payment → inventory → shipping + compensation
@@ -158,7 +159,7 @@ A workflow "step" is: **take the workflow task → replay history → run workfl
 
 - Workers call `Poll(task_queue)` → engine returns a leased task with `lease_expires_at = now + 30s`.
 - Worker must `Ack` (with result) or `Heartbeat` (extends lease) before expiry.
-- Scanner (every 5s in P1) reclaims `leased` tasks past expiry → back to `pending`, `attempts++`.
+- Scanner (every 5s in P1) reclaims `leased` tasks past expiry → back to `pending`. `attempts` counts *deliveries*: it is incremented at lease time (so redelivery and retry both count; the scanner and `FailTask` never touch it).
 - Attempts respect the activity's retry policy: `next_retry_at = now + min(initial * backoff^attempts, max_interval)` + jitter.
 
 ### 6.4 Durable timers (the damaru)
@@ -238,7 +239,7 @@ erDiagram
 | run_id | uuid v7 | PK |
 | workflow_id | text | business key; `UNIQUE (workflow_id) WHERE status='running'` |
 | type | text | e.g. `order-saga` |
-| status | text | `running\|completed\|failed\|cancelled\|terminated\|timed_out\|continued_as_new` |
+| status | text | `running\|completed\|failed\|canceled\|terminated\|timed_out\|continued_as_new` |
 | task_queue | text | |
 | input / result / error | jsonb | |
 | search_attrs | jsonb | indexed (GIN) — visibility filters |
@@ -263,7 +264,7 @@ erDiagram
 | task_id | uuid v7 | PK |
 | run_id / event_id | | links to the `ActivityTaskScheduled` event |
 | type / input | text / jsonb | |
-| state | text | `pending\|leased\|completed\|failed\|cancelled` (see state diagram) |
+| state | text | `pending\|leased\|completed\|failed\|canceled` (see state diagram) |
 | attempts | int | |
 | lease_owner / lease_expires_at | text / timestamptz | nullable |
 | next_retry_at | timestamptz | backoff scheduling |
@@ -277,7 +278,7 @@ erDiagram
 | timer_id | uuid v7 | PK |
 | run_id / event_id | | links to `TimerStarted` |
 | fire_at | timestamptz | indexed for the scanner |
-| state | text | `pending\|fired\|cancelled` |
+| state | text | `pending\|fired\|canceled` |
 
 ### signals_inbox
 
@@ -306,7 +307,7 @@ stateDiagram-v2
         [*] --> running
         running --> completed : workflow returns
         running --> failed : workflow error / nondeterminism
-        running --> cancelled : cancel observed
+        running --> canceled : cancel observed
         running --> terminated : admin terminate
         running --> timed_out : execution_timeout
         running --> continued_as_new : ContinueAsNew
@@ -322,8 +323,8 @@ stateDiagram-v2
     leased --> failed : ack error & no retries left
     leased --> pending : lease expired (redelivery)
     failed --> pending : retry policy says retry (next_retry_at)
-    pending --> cancelled : workflow closed/cancelled
-    leased --> cancelled : workflow closed/cancelled
+    pending --> canceled : workflow closed/canceled
+    leased --> canceled : workflow closed/canceled
 ```
 
 ### Indexes
@@ -347,7 +348,7 @@ func OrderSaga(ctx workflow.Context, in OrderInput) (OrderResult, error) {
     if err := workflow.ExecuteActivity(ctx, ChargePayment, in).Get(ctx, &payment); err != nil {
         return OrderResult{}, err            // nothing to compensate yet
     }
-    if err := workflow.ExecuteActivity(ctx, ReserveInventory, in).Get(ctx, &err); err != nil {
+    if err := workflow.ExecuteActivity(ctx, ReserveInventory, in).Get(ctx, nil); err != nil {
         _ = workflow.ExecuteActivity(ctx, RefundPayment, payment).Get(ctx, nil) // compensation
         return OrderResult{}, err
     }
@@ -383,11 +384,13 @@ SDK surface (P1):
 
 | Concern | Decision |
 |---|---|
-| Config | env only: `DATABASE_URL`, `PORT`, `TANDAV_API_TOKEN`, `LEASE_TTL`, `LOG_LEVEL`, `WORKER_CONCURRENCY` |
+| Config | env only: `DATABASE_URL`, `DB_MAX_CONNS`, `PORT`, `TANDAV_API_TOKEN`, `LEASE_TTL`, `LOG_LEVEL`, `WORKER_CONCURRENCY` |
 | Logging | `log/slog` JSON; every line tagged `run_id`, `workflow_id`, `task_id`, `request_id` |
 | Errors | engine-internal typed errors (`ErrNondeterminism`, `ErrTaskLeaseExpired`, ...) → HTTP envelope at the edge |
 | Graceful shutdown | SIGTERM → stop polls → finish leased attempts (bounded 30s) → close DB |
-| Migrations | numbered SQL, `make migrate` (golang-migrate) |
+| Migrations | **goose**: numbered, up-only, DDL-only SQL; applied at engine boot behind `pg_advisory_lock`, plus `make migrate` (goose CLI) for CI |
+| DB access | **pgx/v5 + pgxpool** (shared pool: API + scanners + worker); SQL authored in `queries/*.sql`, typed code generated by **sqlc** (generated code committed; CI fails on drift) |
+| HTTP stack | stdlib `net/http`, Go 1.22+ `ServeMux` patterns; middleware = `func(http.Handler) http.Handler` chain: RequestID → Recover → Logging → BearerAuth |
 | Time | UTC everywhere; `timestamptz` |
 | IDs | UUIDv7 (time-ordered) |
 
@@ -413,7 +416,7 @@ The crash-recovery test is the one that makes you *feel* the guarantee: `SIGKILL
 | Week | Build (Pass 1) | Open the hood (Pass 2) | Deepen (Pass 3) |
 |---|---|---|---|
 | **1–2** | Go warm-up: Tour of Go → stdlib drills (http, json, context, sync) | `net/http` handler chain; goroutine + channel mechanics | Write a tiny event-log + replay of a toy counter (concept rehearsal) |
-| **3** | Skeleton: config, slog, migrations, error envelope, `/health`; `internal/domain` types + state machines | event sourcing theory (Fowler); UUIDv7, append-only tables | Implement command validation before the engine — test it in isolation |
+| **3** | Skeleton: config, slog, goose migrations, error envelope, `/health`; `internal/domain` types + state machines; sqlc + `store` interface | event sourcing theory (Fowler); UUIDv7, append-only tables; what sqlc generates | Implement command validation before the engine — test it in isolation |
 | **4** | History: append/read events, replay driver, command application (txn) | how Temporal's history service works (docs); DB isolation levels | Golden-history test harness first, engine second |
 | **5** | Matching + Worker SDK: poll/lease/ack, retries, `ExecuteActivity` end-to-end | leasing theory (SQS visibility timeout); backoff + jitter | Lease-expiry race test with `-race` |
 | **6** | Timers, signals, queries, cancel/terminate, continue-as-new | timer wheels; `SKIP LOCKED` semantics | Kill-mid-saga crash test + the order-saga demo |
@@ -437,6 +440,11 @@ The crash-recovery test is the one that makes you *feel* the guarantee: `SIGKILL
 | D8 | Static bearer token auth | JWT/OAuth | Right-sized for P1; auth hardening is P3 |
 | D9 | `SKIP LOCKED` timer/task scanning | Advisory locks, queue table per task | Crash-safe, boring, teachable |
 | D10 | Compensation expressed in workflow code | Engine-enforced saga DSL | Sags are just code branches — keep the engine small |
+| D11 | goose migrations: numbered, up-only, DDL-only | hand-rolled runner; golang-migrate | `-- +goose down` is optional (up-only is native); one txn per file is the atomicity; files double as the sqlc schema source |
+| D12 | pgx/v5 + pgxpool | `database/sql` + stdlib shim; lib/pq (maintenance mode); ORM | Native `jsonb` payloads, batch, `LISTEN/NOTIFY` (P2 timer seam); one modest pool shared by API + scanners + worker |
+| D13 | sqlc-generated typed queries over pgx/v5 | hand-scanned rows; sqlx/Squirrel; GORM/ent | You still write the SQL; codegen guards args/scans; ORMs fight `SKIP LOCKED` / `ON CONFLICT` / partial indexes |
+| D14 | stdlib `net/http` + Go 1.22+ ServeMux | chi; gin/echo | §7 fits patterns + `PathValue`; middleware is plain `func(http.Handler) http.Handler`; zero deps, fully explainable |
+| D15 | Migrations run at engine boot + `make migrate` | separate CLI/CI-only step | `docker compose up` from clean satisfies the DoD; `pg_advisory_lock` makes boot-vs-manual runs safe; revisit at P3 multi-replica |
 
 ---
 

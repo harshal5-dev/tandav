@@ -158,7 +158,7 @@ That loop is the entire engine. Everything else is production hardening.
 | **Workflow execution** | One running instance: `workflow_id` (business key, e.g. `order-421`) + `run_id` (unique per execution) |
 | **Workflow type** | Registered name of the definition (`"order-fulfillment"`) |
 | **Input / result** | JSON-serializable payloads |
-| **Status** | `running → completed \| failed \| cancelled \| terminated \| timed-out` |
+| **Status** | `running → completed \| failed \| canceled \| terminated \| timed-out` |
 | **Continue-As-New** | Compact history by starting a fresh run with carried state — for *infinite* workflows (cron) |
 
 **Workflow ID reuse policy** matters: if `order-421` already has a running execution, what happens when someone starts it again? (Reject / allow-concurrent / terminate-and-restart — an API design decision you'll make.)

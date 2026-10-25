@@ -19,6 +19,6 @@ Read in this order:
 
 | Phase | Design | Implementation |
 |---|---|---|
-| P1 — The Monolith | ✅ Draft v1 | ⏳ not started |
+| P1 — The Monolith | ✅ Draft v1.1 (infra spine decided: D11–D15) | ⏳ not started |
 | P2 — The Dance Spreads | 🗺️ Roadmap only | ⏳ |
 | P3 — The Eternal Dance | 🗺️ Roadmap only | ⏳ |
